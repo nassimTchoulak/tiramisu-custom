@@ -4154,6 +4154,433 @@ std::vector<std::tuple<tiramisu::var,int>> function::correcting_loop_fusion_with
 
 }
 
+// Variant of function::compute_loop_fusion_with_shifting that solves for
+//   [b0, n0, b1, n1, ..., n_{k-1}, b_k]
+// i.e. the k loop shifts n_i AND the k+1 static (beta) offsets around them.
+//
+// Schedule layout reminder (2 loops):  [0, b0, t, b1, i, b2]
+//   dim 0              : dummy
+//   odd dims           : static (beta) dims
+//   even dims >= 2     : dynamic (loop) dims
+//
+// What changed w.r.t. the original is marked with  // [BETA]
+
+// Return value: std::pair<shifts, betas>
+//   .first  : one (var, shift) per var in vars_subjected_to_shifting (same as the original)
+//   .second : k+1 pairs (schedule_dim_index, beta_offset), in schedule order, to be ADDED
+//             to the current computation's static dims
+// Both vectors are empty when fusion is impossible (same convention as the original).
+std::pair<std::vector<std::tuple<tiramisu::var,int>>, std::vector<std::tuple<int,int>>>
+function::compute_loop_fusion_with_shifting_and_beta(
+        std::vector<tiramisu::computation*> previous_computations,
+        tiramisu::computation current_computation,
+        std::vector<tiramisu::var> vars_subjected_to_shifting)
+{
+    DEBUG_FCT_NAME(3);
+    DEBUG_INDENT(4);
+
+    assert(this->dep_read_after_write != NULL);
+    assert(this->dep_write_after_write != NULL);
+    assert(this->dep_write_after_read != NULL);
+    assert(!current_computation.get_name().empty());
+    assert(previous_computations.size() > 0);
+    assert(!previous_computations[0]->get_name().empty());
+    assert(!vars_subjected_to_shifting.empty());
+
+    std::vector<std::string> loops_names;
+    for (auto variable : vars_subjected_to_shifting)
+    {
+        assert(variable.get_name().length() > 0);
+        loops_names.push_back(variable.get_name());
+    }
+
+    std::unordered_map<int, tiramisu::var> dynamic_var_mapping;
+
+    std::vector<int> dimensions =
+        current_computation.get_loop_level_numbers_from_dimension_names(loops_names);
+
+    int schedule_dim_number = 0;
+    int max_dynamic_number = 0;
+    std::vector<int> all_schedule_dim_numbers;
+
+    for (int i = 0; i < dimensions.size(); i++)
+    {
+        schedule_dim_number = tiramisu::loop_level_into_dynamic_dimension(dimensions[i]);
+        dynamic_var_mapping[schedule_dim_number] = vars_subjected_to_shifting[i];
+        all_schedule_dim_numbers.push_back(schedule_dim_number);
+        if (schedule_dim_number > max_dynamic_number)
+            max_dynamic_number = schedule_dim_number;
+    }
+    std::sort(all_schedule_dim_numbers.begin(), all_schedule_dim_numbers.end());
+
+    const int k = all_schedule_dim_numbers.size();
+
+    // ---------------------------------------------------------------- schedules
+    isl_map * current_schedule = isl_map_copy(current_computation.get_schedule());
+
+    std::string empty_union = "{}";
+    isl_union_map * previous_schedules =
+        isl_union_map_read_from_str(this->get_isl_ctx(), empty_union.c_str());
+
+    int m1 = isl_map_dim(current_schedule, isl_dim_out);
+
+    for (auto computation : previous_computations)
+    {
+        isl_map * schedule_itr = isl_map_copy(computation->get_schedule());
+        assert(m1 == isl_map_dim(schedule_itr, isl_dim_out));
+        previous_schedules = isl_union_map_union(previous_schedules,
+                                                 isl_union_map_from_map(schedule_itr));
+    }
+
+    isl_union_map * all_schedules = isl_union_map_copy(previous_schedules);
+    all_schedules = isl_union_map_union(
+        all_schedules, isl_union_map_from_map(isl_map_copy(current_schedule)));
+
+    // ------------------------------------------------------------- dependencies
+    isl_union_map * all_deps = isl_union_map_range_factor_domain(
+        isl_union_map_copy(this->dep_read_after_write));
+    all_deps = isl_union_map_union(all_deps,
+        isl_union_map_range_factor_domain(isl_union_map_copy(this->dep_write_after_read)));
+    all_deps = isl_union_map_union(all_deps,
+        isl_union_map_range_factor_domain(isl_union_map_copy(this->dep_write_after_write)));
+
+    all_deps = isl_union_map_apply_range(all_deps, isl_union_map_copy(all_schedules));
+    all_deps = isl_union_map_apply_domain(all_deps, isl_union_map_copy(all_schedules));
+
+    std::string const_str = "[";
+    std::string domain_str = "{" + current_computation.get_name() + "[";
+    for (int i = 0; i < m1; i++)
+    {
+        const_str += "cx" + std::to_string(i);
+        domain_str += "cx" + std::to_string(i);
+        if (i != (m1 - 1)) { const_str += ","; domain_str += ","; }
+    }
+    const_str += "]";
+    domain_str += "]}";
+
+    std::unordered_map<std::string, isl_map*> name_unificator_map;
+    for (auto computation : previous_computations)
+    {
+        std::string unify = "{" + computation->get_name() + const_str + "->" + const_str + "}";
+        name_unificator_map[computation->get_name()] =
+            isl_map_read_from_str(this->get_isl_ctx(), unify.c_str());
+    }
+
+    std::string complete_current_cst = const_str + "->" + domain_str;
+    isl_union_set * current_fixed_cst =
+        isl_union_set_read_from_str(this->get_isl_ctx(), complete_current_cst.c_str());
+
+    isl_union_map * dep_constants1 = isl_union_map_intersect_domain(
+        isl_union_map_copy(all_deps), isl_union_set_copy(current_fixed_cst));
+    isl_union_map * dep_constants2 = isl_union_map_intersect_range(
+        isl_union_map_copy(all_deps), isl_union_set_copy(current_fixed_cst));
+
+    isl_union_set * origin_set_space =
+        isl_union_set_read_from_str(this->get_isl_ctx(), domain_str.c_str());
+
+    dep_constants1 = isl_union_map_subtract_range(dep_constants1, isl_union_set_copy(origin_set_space));
+    dep_constants2 = isl_union_map_subtract_domain(dep_constants2, isl_union_set_copy(origin_set_space));
+    dep_constants1 = isl_union_map_union(dep_constants1, dep_constants2);
+
+    isl_union_map * universe_of_all_deps = isl_union_map_universe(isl_union_map_copy(dep_constants1));
+
+    std::vector<isl_map *> maps_cases;
+    std::vector<isl_basic_map *> all_basic_maps;
+
+    auto f_maps = [](isl_map * bmap, void * user) {
+        reinterpret_cast<std::vector<isl_map*>*>(user)->push_back(bmap);
+        return isl_stat_ok;
+    };
+    isl_stat (*fun_ptr_map)(isl_map * p, void * m) = (f_maps);
+    isl_union_map_foreach_map(universe_of_all_deps, fun_ptr_map, (void *) &maps_cases);
+
+    auto f = [](isl_basic_map * bmap, void * user) {
+        reinterpret_cast<std::vector<isl_basic_map*>*>(user)->push_back(bmap);
+        return isl_stat_ok;
+    };
+    isl_stat (*fun_ptr)(isl_basic_map * p, void * m) = (f);
+
+    isl_map * my_map1 = NULL;
+    for (auto& space_dep : maps_cases)
+    {
+        my_map1 = isl_union_map_extract_map(dep_constants1, isl_map_get_space(space_dep));
+        isl_map_foreach_basic_map(my_map1, fun_ptr, (void *) &all_basic_maps);
+    }
+
+    // ------------------------------------------------------------------ [BETA]
+    // Unknown vector, in schedule order:  [b0, n0, b1, n1, ..., n_{k-1}, b_k]
+    //   n_i  sits at schedule dim  d_i               (the dynamic dim of shifted loop i)
+    //   b_i  sits at schedule dim  d_i - 1           (static dim just before loop i)
+    //   b_k  sits at schedule dim  d_{k-1} + 1       (static dim just after the innermost
+    //                                                 shifted loop)
+    // When the shifted loops are consecutive, d_i - 1 == d_{i-1} + 1, so the betas are
+    // exactly the "between" statics and no dim is used twice.
+    std::vector<int> beta_positions;
+    for (int i = 0; i < k; i++)
+        beta_positions.push_back(all_schedule_dim_numbers[i] - 1);
+    beta_positions.push_back(all_schedule_dim_numbers[k - 1] + 1);
+
+    assert(beta_positions[0] >= 1);          // dim 0 is the dummy dim, never touched
+    assert(beta_positions[k] < m1);
+
+    std::vector<std::string> sol_names;                       // tuple order
+    std::vector<std::string> addition_entries(m1, "0");       // value added at each sched dim
+    for (int j = 0; j <= k; j++)
+    {
+        std::string b = "b" + std::to_string(j);
+        sol_names.push_back(b);
+        addition_entries[beta_positions[j]] = b;
+        if (j < k)
+        {
+            std::string n = "n" + std::to_string(j);
+            sol_names.push_back(n);
+            addition_entries[all_schedule_dim_numbers[j]] = n;
+        }
+    }
+    const int sol_dim = sol_names.size();                     // 2k+1
+
+    auto join = [](const std::vector<std::string>& v, const std::string& sep) {
+        std::string s;
+        for (size_t i = 0; i < v.size(); i++) { if (i) s += sep; s += v[i]; }
+        return s;
+    };
+
+    std::vector<std::string> conds, zeros(sol_dim, "0");
+    for (auto& nm : sol_names) conds.push_back("0<=" + nm);
+    // NOTE: b >= 0 means "the current computation can only be pushed later in the static
+    // order". Relax here (e.g. -L <= b) if you also want to move it before the references.
+    // Then lexmin picks the most negative value, so shift the variable (b' = b + L) first.
+
+    std::string set_ni      = "[" + join(sol_names, ",") + "]";
+    std::string zero_set    = "[" + join(zeros, ",") + "]";
+    std::string addition_set = "[" + join(addition_entries, ",") + "]";
+
+    std::string addition_map_str = const_str + "->{" + set_ni + "->" + addition_set + "}";
+    std::string solution_set_str = "{" + set_ni + ":" + join(conds, " and ") + "}";
+    std::string zero_set_str     = "{" + zero_set + "}";
+
+    isl_set * zero_set_isl = isl_set_read_from_str(this->get_isl_ctx(), zero_set_str.c_str());
+    isl_map * addition_map = isl_map_read_from_str(this->get_isl_ctx(), addition_map_str.c_str());
+    if (my_map1 != NULL)
+        addition_map = isl_map_gist_params(addition_map, isl_map_params(my_map1));
+
+    isl_set * solution_set      = isl_set_read_from_str(this->get_isl_ctx(), solution_set_str.c_str());
+    isl_set * real_solution_set = isl_set_read_from_str(this->get_isl_ctx(), solution_set_str.c_str());
+
+    DEBUG(5, tiramisu::str_dump(" Solution set is : " + std::string(isl_set_to_str(solution_set))));
+    // example { [b0, n0, b1, n1, b2] : b0 >= 0 and n0 >= 0 and b1 >= 0 and n1 >= 0 and b2 >= 0 }
+    DEBUG(5, tiramisu::str_dump(" Addition map is : " + std::string(isl_map_to_str(addition_map))));
+    // example [cx0..cx5] -> { [b0,n0,b1,n1,b2] -> [0, b0, n0, b1, n1, b2] }
+
+    std::string unify_target = "{" + current_computation.get_name() + const_str + "->" + const_str + "}";
+    isl_map * unify_map_target = isl_map_read_from_str(this->get_isl_ctx(), unify_target.c_str());
+    isl_map * unify_map_origin = NULL;
+
+    bool aborted_fusion = false;
+
+    // Logging helpers: isl_*_to_str returns a malloc'd buffer, these free it.
+    auto map_str = [](isl_map * m) {
+        char * c = isl_map_to_str(m);
+        std::string s = c ? std::string(c) : std::string("<null>");
+        free(c);
+        return s;
+    };
+    auto set_str = [](isl_set * s_) {
+        char * c = isl_set_to_str(s_);
+        std::string s = c ? std::string(c) : std::string("<null>");
+        free(c);
+        return s;
+    };
+
+    // Constant-distance check. Unchanged, except it now also covers the static dims
+    // (they are constants, so they never break the singleton condition by themselves).
+    auto deltas_are_constant = [&](isl_map * dependency_map) {
+        isl_set * deltas = isl_map_deltas(isl_map_copy(dependency_map));
+        DEBUG(5, tiramisu::str_dump("   deltas (before projection)  : " + set_str(deltas)));
+        deltas = isl_set_project_out(deltas, isl_dim_param, 0, m1);
+        deltas = isl_set_project_out(deltas, isl_dim_set, max_dynamic_number + 2, (m1 - 2) - max_dynamic_number);
+        DEBUG(5, tiramisu::str_dump("   deltas (after projection)   : " + set_str(deltas)));
+        bool ok = isl_set_is_singleton(deltas);
+        DEBUG(5, tiramisu::str_dump(std::string("   deltas singleton            : ") + (ok ? "yes" : "no")));
+        isl_set_free(deltas);
+        return ok;
+    };
+
+    int dep_idx = 0;
+
+    for (auto dependency : all_basic_maps)
+    {
+        std::string in_name  = std::string(isl_basic_map_get_tuple_name(dependency, isl_dim_in));
+        std::string out_name = std::string(isl_basic_map_get_tuple_name(dependency, isl_dim_out));
+
+        isl_map * dependency_map = isl_map_from_basic_map(isl_basic_map_copy(dependency));
+
+        bool origin_to_target = (in_name != current_computation.get_name());
+
+        DEBUG(5, tiramisu::str_dump(" ======== dependency #" + std::to_string(dep_idx++) + " : " +
+              in_name + " -> " + out_name +
+              (origin_to_target ? "   (reference -> target)" : "   (target -> reference)") + " ========"));
+        DEBUG(5, tiramisu::str_dump(" [1] dependency in DOMAIN space : " + map_str(dependency_map)));
+
+        if (origin_to_target)
+        {
+            unify_map_origin = name_unificator_map[in_name];
+            dependency_map = isl_map_apply_range(dependency_map, isl_map_copy(unify_map_target));
+            dependency_map = isl_map_apply_domain(dependency_map, isl_map_copy(unify_map_origin));
+        }
+        else
+        {
+            unify_map_origin = name_unificator_map[out_name];
+            dependency_map = isl_map_apply_domain(dependency_map, isl_map_copy(unify_map_target));
+            dependency_map = isl_map_apply_range(dependency_map, isl_map_copy(unify_map_origin));
+        }
+
+        DEBUG(5, tiramisu::str_dump(" [2] dependency in TIMESTAMP space : " + map_str(dependency_map)));
+
+        if (!deltas_are_constant(dependency_map))
+        {
+            DEBUG(5, tiramisu::str_dump(" -### dependency contains non constant distance !! fusion aborted "));
+            aborted_fusion = true;
+            isl_map_free(dependency_map);
+            isl_basic_map_free(dependency);
+            break;
+        }
+
+        isl_set * origin_set = origin_to_target ? isl_map_domain(isl_map_copy(dependency_map))
+                                                : isl_map_range(isl_map_copy(dependency_map));
+        isl_set * target_set = origin_to_target ? isl_map_range(isl_map_copy(dependency_map))
+                                                : isl_map_domain(isl_map_copy(dependency_map));
+
+        // reference side: the origin timestamps do not move -> solution tuple fixed to zeros
+        isl_map * origin_free_map = isl_map_from_domain_and_range(
+            isl_set_copy(zero_set_isl), isl_set_copy(origin_set));
+
+        DEBUG(5, tiramisu::str_dump(" [3] origin timestamps set (reference side) : " + set_str(origin_set)));
+        DEBUG(5, tiramisu::str_dump(" [3] target timestamps set (before shift)    : " + set_str(target_set)));
+        DEBUG(5, tiramisu::str_dump(" [4] reference map (zeros -> origin)         : " + map_str(origin_free_map)));
+
+        // target side: timestamp + addition_map(b0,n0,b1,n1,b2)
+        isl_map * target_dependant_map = isl_map_from_domain_and_range(
+            isl_set_copy(solution_set), isl_set_copy(target_set));
+        DEBUG(5, tiramisu::str_dump(" [5] target map BEFORE addition (sol -> ts)  : " + map_str(target_dependant_map)));
+        DEBUG(5, tiramisu::str_dump(" [5] addition map                            : " + map_str(addition_map)));
+        target_dependant_map = isl_map_sum(target_dependant_map, isl_map_copy(addition_map));
+        DEBUG(5, tiramisu::str_dump(" [6] target map AFTER addition (result of sum): " + map_str(target_dependant_map)));
+
+        // The lex order is over the FULL timestamp, so statics are compared
+        // exactly like loop dims: this is what makes the betas legal to solve for.
+        isl_map * iteration_result;
+        isl_set * iteration_result_set;
+        if (origin_to_target)
+        {   // origin < target
+            DEBUG(5, tiramisu::str_dump(" [7] lex_lt LEFT  side (origin, fixed)    : " + map_str(origin_free_map)));
+            DEBUG(5, tiramisu::str_dump(" [7] lex_lt RIGHT side (target, shifted)  : " + map_str(target_dependant_map)));
+            iteration_result = isl_map_lex_lt_map(origin_free_map, target_dependant_map);
+            DEBUG(5, tiramisu::str_dump(" [8] lex_lt result (origin < target)      : " + map_str(iteration_result)));
+            iteration_result_set = isl_map_range(iteration_result);
+        }
+        else
+        {   // target < origin
+            DEBUG(5, tiramisu::str_dump(" [7] lex_lt LEFT  side (target, shifted)  : " + map_str(target_dependant_map)));
+            DEBUG(5, tiramisu::str_dump(" [7] lex_lt RIGHT side (origin, fixed)    : " + map_str(origin_free_map)));
+            iteration_result = isl_map_lex_lt_map(target_dependant_map, origin_free_map);
+            DEBUG(5, tiramisu::str_dump(" [8] lex_lt result (target < origin)      : " + map_str(iteration_result)));
+            iteration_result_set = isl_map_domain(iteration_result);
+        }
+
+        DEBUG(5, tiramisu::str_dump(" [9] solutions kept by this dependency (before param projection) : " +
+              set_str(iteration_result_set)));
+
+        iteration_result_set = isl_set_project_out(iteration_result_set, isl_dim_param, 0, m1);
+        iteration_result_set = isl_set_coalesce(iteration_result_set);
+
+        DEBUG(5, tiramisu::str_dump(" local set solution : " + std::string(isl_set_to_str(iteration_result_set))));
+
+        real_solution_set = isl_set_intersect(real_solution_set, iteration_result_set);
+
+        DEBUG(5, tiramisu::str_dump(" cumulative solution : " + std::string(isl_set_to_str(real_solution_set))));
+
+        isl_set_free(origin_set);
+        isl_set_free(target_set);
+        isl_map_free(dependency_map);
+        isl_basic_map_free(dependency);
+    }
+
+    isl_set * result_set = real_solution_set;
+    DEBUG(3, tiramisu::str_dump(" Final result set of [b0,n0,b1,n1,b2] : " + std::string(isl_set_to_str(result_set))));
+
+    // ------------------------------------------------------------- extraction
+    std::vector<std::tuple<tiramisu::var,int>> result_shifts;
+    std::vector<std::tuple<int,int>> result_betas;   // (schedule dim, offset)
+
+    if (!aborted_fusion && (isl_set_is_empty(result_set) == isl_bool_false))
+    {
+        // isl_set_lexmin on the whole set is the global lexicographic minimum, so the
+        // per-basic-set loop of the original is not needed.
+        //
+        // Priority is the tuple order  b0 > n0 > b1 > n1 > ... > b_k :
+        // outermost levels first, which keeps the computations fused at the deepest
+        // possible level (b_i != 0 at an outer level would split the loop nests).
+        isl_set * best = isl_set_lexmin(isl_set_copy(result_set));
+
+        DEBUG(3, tiramisu::str_dump(" lowest cost chosen solution is : " + std::string(isl_set_to_str(best))));
+
+        if (isl_set_is_singleton(best) == isl_bool_true)
+        {
+            isl_basic_set * pre_val = isl_set_polyhedral_hull(best);
+
+            for (int idx = 0; idx < sol_dim; idx++)
+            {
+                isl_val * value = isl_basic_set_dim_max_val(isl_basic_set_copy(pre_val), idx);
+                int v = (int) isl_val_get_num_si(value);
+                isl_val_free(value);
+
+                int j = idx / 2;
+                if (idx % 2 == 0)      // b_j
+                {
+                    result_betas.push_back(std::make_tuple(beta_positions[j], v));
+                }
+                else                   // n_j
+                {
+                    result_shifts.push_back(std::make_tuple(
+                        dynamic_var_mapping[all_schedule_dim_numbers[j]], v));
+                }
+            }
+
+            for (auto& b : result_betas)
+                DEBUG(3, tiramisu::str_dump(" Beta at sched dim " + std::to_string(std::get<0>(b)) +
+                      " = " + std::to_string(std::get<1>(b))));
+            for (auto& s : result_shifts)
+                DEBUG(3, tiramisu::str_dump(" Shifting for var :" + std::get<0>(s).get_name() +
+                      " " + std::to_string(std::get<1>(s))));
+
+            isl_basic_set_free(pre_val);
+        }
+        else
+        {
+            isl_set_free(best);
+            DEBUG(3, tiramisu::str_dump(" no unique lexmin (unbounded?) "));
+        }
+    }
+    else
+    {
+        DEBUG(3, tiramisu::str_dump(" fusion is impossible "));
+    }
+
+    name_unificator_map.clear();
+    dynamic_var_mapping.clear();
+    all_schedule_dim_numbers.clear();
+    all_basic_maps.clear();
+
+    isl_union_map_free(all_deps);
+    isl_set_free(result_set);
+    isl_union_map_free(all_schedules);
+    isl_union_map_free(dep_constants1);
+    isl_union_map_free(universe_of_all_deps);
+
+    DEBUG_INDENT(-4);
+    return std::make_pair(result_shifts, result_betas);
+}
 
 std::vector<isl_basic_set*> tiramisu::function::compute_legal_skewing(std::vector<tiramisu::computation *> fused_computations, tiramisu::var outer_variable,
                                               tiramisu::var inner_variable, int&  legal_process)

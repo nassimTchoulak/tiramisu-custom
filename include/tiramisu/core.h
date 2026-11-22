@@ -1428,6 +1428,27 @@ public:
     */
     std::vector<std::tuple<tiramisu::var,int>> correcting_loop_fusion_with_shifting(std::vector<tiramisu::computation*> previous_computations, tiramisu::computation current, std::vector<tiramisu::var> vars_subjected_to_shifting);
 
+    // Variant of function::compute_loop_fusion_with_shifting that solves for
+    //   [b0, n0, b1, n1, ..., n_{k-1}, b_k]
+    // i.e. the k loop shifts n_i AND the k+1 static (beta) offsets around them.
+    //
+    // Schedule layout reminder (2 loops):  [0, b0, t, b1, i, b2]
+    //   dim 0              : dummy
+    //   odd dims           : static (beta) dims
+    //   even dims >= 2     : dynamic (loop) dims
+    //
+    // What changed w.r.t. the original is marked with  // [BETA]
+
+    // Return value: std::pair<shifts, betas>
+    //   .first  : one (var, shift) per var in vars_subjected_to_shifting (same as the original)
+    //   .second : k+1 pairs (schedule_dim_index, beta_offset), in schedule order, to be ADDED
+    //             to the current computation's static dims
+    // Both vectors are empty when fusion is impossible (same convention as the original).
+    std::pair<std::vector<std::tuple<tiramisu::var,int>>, std::vector<std::tuple<int,int>>>
+    compute_loop_fusion_with_shifting_and_beta(
+            std::vector<tiramisu::computation*> previous_computations,
+            tiramisu::computation current_computation,
+            std::vector<tiramisu::var> vars_subjected_to_shifting);
     /**
      * Uses the dependency analysis to check if the specified schedules of computations are legal.
      * This method only tests the dependencies between the computations specified in the input and ignore the rest.
