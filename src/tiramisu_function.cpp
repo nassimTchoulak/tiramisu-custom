@@ -3619,6 +3619,7 @@ std::vector<std::tuple<tiramisu::var,int>> function::correcting_loop_fusion_with
         }
     }
 
+    // All loop dimensions number in the schedules (in target)
     std::sort(all_schedule_dim_numbers.begin(), all_schedule_dim_numbers.end()); 
 
     isl_map * current_schedule =  isl_map_copy(current_computation.get_schedule());
@@ -3674,6 +3675,7 @@ std::vector<std::tuple<tiramisu::var,int>> function::correcting_loop_fusion_with
         isl_union_map_range_factor_domain(isl_union_map_copy(this->dep_write_after_write))
     );
 
+    // Apply the schedule to both sides of the dependencies
     all_deps = isl_union_map_apply_range(
         all_deps,
         isl_union_map_copy(all_schedules));
@@ -3716,6 +3718,7 @@ std::vector<std::tuple<tiramisu::var,int>> function::correcting_loop_fusion_with
 
     std::string complete_current_cst = const_str+"->"+domain_str;
 
+    // a set the have params [cx1, cx2 ...] -> { Current[cx1, cx2 ...]}
     isl_union_set * current_fixed_cst = isl_union_set_read_from_str(this->get_isl_ctx(),complete_current_cst.c_str());
 
     DEBUG(3, tiramisu::str_dump(" fixed current set : "+std::string(isl_union_set_to_str(current_fixed_cst))));
@@ -3883,8 +3886,11 @@ std::vector<std::tuple<tiramisu::var,int>> function::correcting_loop_fusion_with
     isl_set * real_solution_set = isl_set_read_from_str(this->get_isl_ctx(),solution_set_str.c_str());
 
     DEBUG(5, tiramisu::str_dump(" Solution set is : "+std::string(isl_set_to_str(solution_set))));
+    // example { [n0, n1] : n0 >= 0 and n1 >= 0 }
 
     DEBUG(5, tiramisu::str_dump(" Addition map is : "+std::string(isl_map_to_str(addition_map))));
+    // example [cx0, cx1, cx2, cx3, cx4, cx5] -> { [n0, n1] -> [0, 0, n0, 0, n1, 0] }
+
     // would be used in sum op to create dependent map
 
     DEBUG(5, tiramisu::str_dump(" Zeros set is : "+std::string(isl_set_to_str(zero_set_isl))));
@@ -3924,8 +3930,14 @@ std::vector<std::tuple<tiramisu::var,int>> function::correcting_loop_fusion_with
 
             //check if delta is singleton
             isl_set * deltas = isl_map_deltas(isl_map_copy(dependency_map));
+
+            DEBUG(5, tiramisu::str_dump(" Delta of dependency: "+std::string(isl_set_to_str(deltas))));
+
             deltas = isl_set_project_out(deltas,isl_dim_param,0,m1);
             deltas = isl_set_project_out(deltas,isl_dim_set,max_dynamic_number+2,(m1-2)-max_dynamic_number);
+
+            DEBUG(5, tiramisu::str_dump(" Delta of dependency after projection: "+std::string(isl_set_to_str(deltas))));
+
             if(!isl_set_is_singleton(deltas))
             {
                 DEBUG(5, tiramisu::str_dump(" -### dependendency contains constants !! fusion aborted "));
@@ -3956,7 +3968,8 @@ std::vector<std::tuple<tiramisu::var,int>> function::correcting_loop_fusion_with
             target_dependant_map = isl_map_sum(isl_map_copy(target_dependant_map),isl_map_copy(addition_map));
 
             DEBUG(10, tiramisu::str_dump(" Target map : "+std::string(isl_map_to_str(target_dependant_map))));
-
+            
+            // finds elements in domaine that makes range1 <= range2 
             isl_map * iteration_result = isl_map_lex_lt_map(origin_free_map,target_dependant_map);
 
             DEBUG(5, tiramisu::str_dump(" local solution : "+std::string(isl_map_to_str(iteration_result))));
