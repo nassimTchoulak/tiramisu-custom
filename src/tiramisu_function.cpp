@@ -4498,6 +4498,9 @@ std::vector<std::tuple<tiramisu::var,int>> function::correcting_loop_fusion_with
 
     bool aborted_fusion = false;
 
+    // each cell : (schedule_dim_number, loop number, delta value) only for deltas <= -1
+    std::vector<std::tuple<int,int,int>> negative_deltas;
+
     for(auto dependency:all_basic_maps)
     {
         in_name = std::string(isl_basic_map_get_tuple_name(dependency,isl_dim_in));
@@ -4535,6 +4538,24 @@ std::vector<std::tuple<tiramisu::var,int>> function::correcting_loop_fusion_with
                 break;
             
             }
+
+            // deltas is a singleton here: log its value for each loop level (iterator) only, skipping static dimensions
+            for(int i=0; i<all_schedule_dim_numbers.size(); i++)
+            {
+                isl_val * delta_val = isl_set_dim_max_val(isl_set_copy(deltas),all_schedule_dim_numbers[i]);
+
+                int delta_int = (int) isl_val_get_d(delta_val);
+
+                DEBUG(5, tiramisu::str_dump(" Delta for var : "+dynamic_var_mapping[all_schedule_dim_numbers[i]].get_name()+" = "+std::to_string(delta_int)));
+
+                if(delta_int <= -1)
+                {
+                    negative_deltas.push_back(std::make_tuple(all_schedule_dim_numbers[i], i, delta_int));
+                }
+
+                isl_val_free(delta_val);
+            }
+
             isl_set_free(deltas);
 
             
@@ -4606,6 +4627,22 @@ std::vector<std::tuple<tiramisu::var,int>> function::correcting_loop_fusion_with
                 break;
             
             }
+            // deltas is a singleton here: log its value for each loop level (iterator) only, skipping static dimensions
+            for(int i=0; i<all_schedule_dim_numbers.size(); i++)
+            {
+                isl_val * delta_val = isl_set_dim_max_val(isl_set_copy(deltas),all_schedule_dim_numbers[i]);
+
+                int delta_int = (int) isl_val_get_d(delta_val);
+
+                DEBUG(5, tiramisu::str_dump(" Delta for var : "+dynamic_var_mapping[all_schedule_dim_numbers[i]].get_name()+" = "+std::to_string(delta_int)));
+
+                if(delta_int <= -1)
+                {
+                    negative_deltas.push_back(std::make_tuple(all_schedule_dim_numbers[i], i, delta_int));
+                }
+
+                isl_val_free(delta_val);
+            }
             isl_set_free(deltas);
 
             
@@ -4654,8 +4691,76 @@ std::vector<std::tuple<tiramisu::var,int>> function::correcting_loop_fusion_with
 
     isl_set * result_set = real_solution_set;
 
-
     DEBUG(3, tiramisu::str_dump(" Final result set of n1,n2 ... : "+std::string(isl_set_to_str(result_set))));
+
+    // positivity constraints collected for all loop involved sorting and make unique
+    // sort by loop (outermost first), then by delta (lowest first)
+    std::sort(negative_deltas.begin(), negative_deltas.end(),
+        [](const std::tuple<int,int,int>& a, const std::tuple<int,int,int>& b)
+        {
+            if(std::get<1>(a) != std::get<1>(b))
+                return std::get<1>(a) < std::get<1>(b);
+            return std::get<2>(a) < std::get<2>(b);
+        });
+
+    // keep only the lowest delta for each loop (first occurrence after sorting)
+    negative_deltas.erase(
+        std::unique(negative_deltas.begin(), negative_deltas.end(),
+            [](const std::tuple<int,int,int>& a, const std::tuple<int,int,int>& b)
+            {
+                return std::get<1>(a) == std::get<1>(b);
+            }),
+        negative_deltas.end());
+
+    // one positivity constraint set per loop having a negative delta (outermost loop first)
+    // example : loop 0 has delta -1 -> {[n0,n1,n2 ...] : n0 >= 0}
+    std::vector<isl_set *> positivity_constraints;
+
+    for(auto nd : negative_deltas)
+    {
+        std::string constraint_str = "{"+set_ni+" : n"+std::to_string(std::get<1>(nd))+" >= " + std::to_string(std::abs(std::get<2>(nd)))  + "}";
+
+        isl_set * constraint = isl_set_read_from_str(this->get_isl_ctx(),constraint_str.c_str());
+
+        DEBUG(5, tiramisu::str_dump(" Positivity constraint : "+std::string(isl_set_to_str(constraint))));
+
+        positivity_constraints.push_back(constraint);
+    }
+
+    /**
+     * Try to satisfy as many positivity constraints as possible :
+     * start with all of them, and if there is no solution, drop one more constraint
+     * (starting from the outermost loop) at each try, until falling back to no constraints.
+    */
+    if(!aborted_fusion)
+    {
+        for(int skipped=0; skipped<=positivity_constraints.size(); skipped++)
+        {
+            isl_set * candidate_set = isl_set_copy(result_set);
+
+            for(int j=skipped; j < positivity_constraints.size(); j++)
+            {
+                candidate_set = isl_set_intersect(candidate_set,isl_set_copy(positivity_constraints[j]));
+            }
+
+            if(isl_set_is_empty(candidate_set) == isl_bool_false)
+            {
+                DEBUG(3, tiramisu::str_dump(" Solution found after dropping "+std::to_string(skipped)+" positivity constraint(s) : "+std::string(isl_set_to_str(candidate_set))));
+
+                isl_set_free(result_set);
+                result_set = candidate_set;
+                break;
+            }
+
+            isl_set_free(candidate_set);
+        }
+    }
+
+    for(auto constraint : positivity_constraints)
+    {
+        isl_set_free(constraint);
+    }
+    positivity_constraints.clear();
 
     /**
      * Now that solving is over, we either have an empty set : no solutions -> fusion impossible
