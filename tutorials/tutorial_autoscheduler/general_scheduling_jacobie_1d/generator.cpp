@@ -62,7 +62,6 @@ int main(int argc, char **argv)
     assert(fct->check_partial_legality_in_function({&comp_A, &comp_B}) == false);
 
 
-
     // 2nd try: remove j
     auto shiftings2 = fct->correcting_loop_fusion_with_shifting({&comp_B}, comp_A, {t, i});
     assert(shiftings2.size() > 0);
@@ -74,7 +73,9 @@ int main(int argc, char **argv)
 
     assert(tiramisu::check_legality_of_function() == true);
     assert(fct->check_partial_legality_in_function({&comp_A, &comp_B}) == true);
+ 
 
+    fct->skewing_local_solver_positive({&comp_A, &comp_B}, t, i, 0);
 
     // -------------------------------------------------------
     // Code Generation

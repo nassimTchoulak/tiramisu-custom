@@ -1554,6 +1554,15 @@ public:
 
     std::tuple<int,int,int,int,int,int,int,int,int> extract_3d_skewing_params(isl_basic_map * transformation);
 
+    std::tuple<
+      std::vector<std::tuple<int,int,int,int,int,int,int,int,int,int,int,int,int,int,int,int>>,
+      std::vector<std::tuple<int,int,int,int,int,int,int,int,int,int,int,int,int,int,int,int>>,
+      std::vector<std::tuple<int,int,int,int,int,int,int,int,int,int,int,int,int,int,int,int>>> skewing_local_4D_solver_positive(
+                                                  std::vector<tiramisu::computation *> fused_computations, tiramisu::var var_outer,
+                                                  tiramisu::var var2, tiramisu::var var3, tiramisu::var var_inner);
+
+    std::tuple<int,int,int,int,int,int,int,int,int,int,int,int,int,int,int,int> extract_4d_skewing_params(isl_basic_map * transformation);
+
     /**
      * for each computation, it computes potentiel canidate for vectorization, then it regroups it in result vector. 
     */

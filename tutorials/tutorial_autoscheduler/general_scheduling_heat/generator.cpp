@@ -64,11 +64,7 @@ int main(int argc, char **argv)
 
     tiramisu::prepare_schedules_for_legality_checks(true);
 
-    assert(fct->check_partial_legality_in_function({&A_out, &B_out}) == false);
 
-
-
-    // 2nd try: remove j
     auto shiftings2 = fct->correcting_loop_fusion_with_shifting({&B_out}, A_out, {t, i, j, k});
     assert(shiftings2.size() > 0);
 
@@ -76,10 +72,14 @@ int main(int argc, char **argv)
     {
         A_out.shift(std::get<0>(tup), std::get<1>(tup));
     }
+    /*A_out.shift(i, 1);
+    A_out.shift(j, 1);
+    A_out.shift(k, 1);*/
 
     assert(tiramisu::check_legality_of_function() == true);
     assert(fct->check_partial_legality_in_function({&A_out, &B_out}) == true);
 
+    fct->skewing_local_4D_solver_positive({&A_out, &B_out}, t, i, j, k);
 
     // -------------------------------------------------------
     // Code Generation

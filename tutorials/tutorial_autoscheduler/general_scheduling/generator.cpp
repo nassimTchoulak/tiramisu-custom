@@ -24,13 +24,13 @@ void generate_function(std::string name, int size)
     // -------------------------------------------------------
     // Layer I: algorithm
     // -------------------------------------------------------
-    tiramisu::constant N("N", tiramisu::expr((int32_t) size));
-    tiramisu::var i("i", 1, N - 2), j("j", 1, N - 2);
+    // tiramisu::constant N("N", tiramisu::expr((int32_t) size));
+    tiramisu::var i("i", 1, 100), j("j", 1, 100);
 
     tiramisu::input A("A", {i, j}, tiramisu::p_uint8);
 
     tiramisu::computation B_out("B_out", {i, j},
-        A(i - 1, j) + A(i + 1, j) + A(i, j - 1) + A(i, j + 1) + A(i, 3));
+         A(5, 5));
 
     /* A(i,0) would not be within the execution range of B_out, so fusion
        with shifting would be possible; not the case for A(i,3). */
@@ -44,7 +44,7 @@ void generate_function(std::string name, int size)
     // -------------------------------------------------------
     // Layer III: buffers
     // -------------------------------------------------------
-    tiramisu::buffer b_A("b_A", {N, N}, tiramisu::p_uint8, tiramisu::a_input);
+    tiramisu::buffer b_A("b_A", {100, 100}, tiramisu::p_uint8, tiramisu::a_input);
 
     A.store_in(&b_A);
     A_out.store_in(&b_A, {i, j});
@@ -71,8 +71,11 @@ void generate_function(std::string name, int size)
     auto shiftings = fct->correcting_loop_fusion_with_shifting({&B_out}, A_out, {i, j});
     assert(shiftings.size() == 0);
 
+	    fct->compute_loop_fusion_with_shifting_and_beta({&B_out}, A_out, {i, j});
+
     // 2nd try: remove j
-    auto shiftings2 = fct->correcting_loop_fusion_with_shifting({&B_out}, A_out, {i});
+    /*
+	auto shiftings2 = fct->correcting_loop_fusion_with_shifting({&B_out}, A_out, {i});
     assert(shiftings2.size() > 0);
 
     for (auto const &tup : shiftings2)
@@ -86,6 +89,7 @@ void generate_function(std::string name, int size)
     // -------------------------------------------------------
     // Code generation (written in the current dir, i.e. build/)
     // -------------------------------------------------------
+	*/
     tiramisu::codegen({&b_A}, "function.o");
 }
 
